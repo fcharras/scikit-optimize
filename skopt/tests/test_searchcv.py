@@ -66,7 +66,11 @@ def test_searchcv_runs(surrogate, n_jobs):
             'degree': Integer(1, 8),
             'kernel': Categorical(['linear', 'poly', 'rbf']),
         },
-        n_jobs=n_jobs, n_iter=11,
+        n_jobs=n_jobs, n_iter=24,
+        optimizer_kwargs=None,
+        n_initial_points=12,
+        n_points_per_iter=2,
+        pre_dispatch=100,  # triggers automatic setting
         optimizer_kwargs=optimizer_kwargs
     )
 

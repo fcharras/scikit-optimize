@@ -7,7 +7,7 @@ from scipy.stats import rankdata
 from operator import itemgetter
 
 from sklearn.base import is_classifier, clone
-from joblib import Parallel, delayed, cpu_count
+from .externals.joblib import Parallel, delayed, cpu_count
 from sklearn.model_selection._search import BaseSearchCV
 from sklearn.utils import check_random_state
 from sklearn.utils.fixes import MaskedArray
@@ -499,10 +499,7 @@ class BayesSearchCV(BaseSearchCV):
         sp_partial_batch_results = [([], []) for sp in search_spaces]
         n_iters_queued = n_initial_points
         while n_iters_queued < n_iters or len(task_queue) > 0:
-            try:
-                batch = pool.get_last_async_result().result()
-            except IndexError:
-                batch = []  # happens when no job have completed yet.
+            batch = pool.get_last_async_result()
             for res in batch:
                 (sp_i, cand_i, split_i, p) = res[-4:]
                 cand_log = cand_logs[_make_hashable(p)]

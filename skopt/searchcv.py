@@ -22,8 +22,9 @@ except ImportError:
 from dask.distributed import Client, as_completed
 
 from . import Optimizer
-from .utils import point_asdict, dimensions_aslist
+from .utils import point_asdict, dimensions_aslist, eval_callbacks
 from .space import check_dimension
+from .callbacks import check_callback
 
 
 def _call_and_get_cfg(payload):
@@ -145,9 +146,8 @@ class BayesSearchCV(BaseSearchCV):
         FitFailedWarning is raised. This parameter does not affect the refit
         step, which will always raise the error.
 
-    return_train_score : boolean, default=True
-        If ``'False'``, the ``cv_results_`` attribute will not include training
-        scores.
+    return_train_score : boolean, default=False
+        If ``'True'``, the ``cv_results_`` attribute will include trainin
 
     Examples
     --------
@@ -276,13 +276,11 @@ class BayesSearchCV(BaseSearchCV):
 
     """
 
-    def __init__(self, estimator, search_spaces, deterministic=True,
-                 optimizer_kwargs=None,
+    def __init__(self, estimator, search_spaces, optimizer_kwargs=None,
                  n_iter=50, scoring=None, fit_params=None, n_initial_points=1,
                  n_points=1, n_jobs=1, iid=True, refit=True, cv=None,
-                 verbose=0, pre_dispatch='2*n_jobs', batch_size=1,
-                 random_state=None, error_score='raise',
-                 return_train_score=True):
+                 verbose=0, random_state=None, error_score='raise',
+                 return_train_score=False):
 
         self.search_spaces = search_spaces
         self.n_iter = n_iter
@@ -298,10 +296,10 @@ class BayesSearchCV(BaseSearchCV):
         self.fit_params = fit_params
 
         super(BayesSearchCV, self).__init__(
-            estimator=estimator, scoring=scoring,
-            n_jobs=n_jobs, iid=iid, refit=refit, cv=cv, verbose=verbose,
-            pre_dispatch=pre_dispatch, error_score=error_score,
-            return_train_score=return_train_score)
+             estimator=estimator, scoring=scoring,
+             n_jobs=n_jobs, iid=iid, refit=refit, cv=cv, verbose=verbose,
+             pre_dispatch=None, error_score=error_score,
+             return_train_score=return_train_score)
 
     def _check_search_space(self, search_space):
         """Checks whether the search space argument is correct"""
@@ -437,7 +435,7 @@ class BayesSearchCV(BaseSearchCV):
         for point_idx, param in enumerate(params, point_idx + 1):
 
             point_logs[point_idx] = [None] * n_splits
-            p_dict = point_asdict(space, param)
+            p_dict = point_asdict(space, [np.array(v).item() for v in param])
             for split_i, (train, test) in cv_iter:
 
                 args = [base_estimator, X, y, self.scorer_, train, test,
@@ -457,7 +455,7 @@ class BayesSearchCV(BaseSearchCV):
         return new_tasks, point_idx
 
     def _compute(self, client, base_estimator, n_initial_points, n_iters,
-                 n_points, X, y, n_splits, search_spaces, cv_iter):
+                 n_points, X, y, n_splits, search_spaces, cv_iter, callbacks):
         """Generate points asynchronously and log the results.
         """
 
@@ -494,7 +492,13 @@ class BayesSearchCV(BaseSearchCV):
                 remaining_iter = n_iters[space_idx] - n_iters_queued[space_idx]
                 if len(scores) == n_points[space_idx] and remaining_iter > 0:
                     space_arriving_results[space_idx] = ([], [])
-                    optimizers[space_idx].tell(params, scores)
+                    optim_result = optimizers[space_idx].tell(params, scores)
+                    # ???: there used to be a possibility to interrupt
+                    # computations for a search space through the callback.
+                    # It is now somewhat more complicated now because other
+                    # futures might not have been consumed yet. What were
+                    # exactly the usecases for this feature ?
+                    eval_callbacks(callbacks, optim_result)
                     n_points_ = min(n_points[space_idx], remaining_iter)
                     point_idx = self._ask_new_tasks(
                         point_idx, space_idx, search_spaces[space_idx],
@@ -530,7 +534,7 @@ class BayesSearchCV(BaseSearchCV):
             total_iter += n_iter
         return total_iter
 
-    def fit(self, X, y=None, groups=None, callbacks=None):
+    def fit(self, X, y=None, groups=None, callback=None):
         """Run fit on the estimator with randomly drawn parameters.
 
         Parameters
@@ -545,10 +549,17 @@ class BayesSearchCV(BaseSearchCV):
         groups : array-like, with shape (n_samples,), optional
             Group labels for the samples used while splitting the dataset into
             train/test set.
+
+        callback: [callable, list of callables, optional]
+            If callable then `callback(res)` is called after each parameter
+            combination tested. If list of callables, then each callable in
+            the list is called.
         """
 
         search_spaces, n_initial_points, n_iters, n_points = \
             self._init_search_spaces()
+
+        callbacks = check_callback(callback)
 
         self._make_optimizers(search_spaces)
 
@@ -580,13 +591,15 @@ class BayesSearchCV(BaseSearchCV):
                        in enumerate(cv.split(X, y, groups))]
             out = self._compute(
                 client, base_estimator, n_initial_points, n_iters, n_points,
-                X, y, n_splits, search_spaces, cv_iter)
+                X, y, n_splits, search_spaces, cv_iter, callbacks)
 
         # sort by candidate and then by split.
         out = map(itemgetter(slice(None, -4)),
                   sorted(out, key=itemgetter(-3, -2)))
 
-        # if one choose to see train score, "out" will contain train score info
+        # All the following is basically copy/pasted from sklearn. Beware to
+        # retrocompatibility.
+        # If one choose to see train score, "out" will contain train score info
         if self.return_train_score:
             (train_scores, test_scores, test_sample_counts,
              fit_time, score_time, parameters) = zip(*out)

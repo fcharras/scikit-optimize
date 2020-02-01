@@ -1,4 +1,4 @@
-from collections import defaultdict, deque, Hashable
+from collections import defaultdict
 from functools import partial
 
 import numpy as np
@@ -7,31 +7,28 @@ from scipy.stats import rankdata
 from operator import itemgetter
 
 from sklearn.base import is_classifier, clone
-from .externals.joblib import Parallel, delayed, cpu_count
+from joblib import cpu_count, delayed
 from sklearn.model_selection._search import BaseSearchCV
 from sklearn.utils import check_random_state
 from sklearn.utils.fixes import MaskedArray
 from sklearn.utils.validation import indexable, check_is_fitted
-from sklearn.metrics.scorer import check_scoring
 from sklearn.model_selection._validation import check_cv
 from sklearn.model_selection._validation import _fit_and_score
+try:
+    from sklearn.metrics import check_scoring
+except ImportError:
+    from sklearn.metrics.scorer import check_scoring
+
+from dask.distributed import Client, as_completed
 
 from . import Optimizer
 from .utils import point_asdict, dimensions_aslist
 from .space import check_dimension
 
 
-def _call_and_get_cfg(f, cfg, args, kwargs):
-    return [*f(*args, **kwargs), *cfg]
-
-
-def _make_hashable(p):
-    return tuple(tuple(e) if not isinstance(e, Hashable) and not
-                 isinstance(e, dict) else e for e in p)
-
-
-def _return_input(x):
-    return x
+def _call_and_get_cfg(payload):
+    f, cfg, args, kwargs = payload
+    return tuple(*f(*args, **kwargs), *cfg)
 
 
 class BayesSearchCV(BaseSearchCV):
@@ -60,11 +57,6 @@ class BayesSearchCV(BaseSearchCV):
         Either estimator needs to provide a ``score`` function,
         or ``scoring`` must be passed.
 
-    deterministic : bool
-        if True it is considered that the estimator is deterministic,
-        else uncertainty on the evaluations is taken into account and
-        a same point can be evaluated several times.
-
     search_spaces : dict, list of dict or list of tuple containing
         (dict, dict).
         One of these cases:
@@ -84,18 +76,13 @@ class BayesSearchCV(BaseSearchCV):
         some search subspace, similarly as in case 2, and second element
         can override global parameters for specific subspace. Currently
         support overriding `n_iter`, `n_initial_points` and
-        `n_points_per_iter`.
+        `n_points`.
 
-    n_iter : int, default=128
+    n_iter : int, default=50
         Number of parameter settings that are sampled. n_iter trades
-        off runtime vs quality of the solution.
-
-    n_points_per_iter: int, default = 1
-        Number of points computed at each iteration.
-        ???: isn't 1 always the best value ?
-
-    n_initial_points : int, default = 1
-        Must be >= n_points_per_iter.
+        off runtime vs quality of the solution. Consider increasing
+        ``n_points`` if you want to try more parameter settings in
+        parallel.
 
     optimizer_kwargs : dict, optional
         Dict of arguments passed to :class:`Optimizer`.  For example,
@@ -108,23 +95,20 @@ class BayesSearchCV(BaseSearchCV):
         ``scorer(estimator, X, y)``.
         If ``None``, the ``score`` method of the estimator is used.
 
+    fit_params : dict, optional
+        Parameters to pass to the fit method.
+
     n_jobs : int, default=1
-        Number of jobs to run in parallel.
+        Number of jobs to run in parallel. At maximum there are
+        ``n_points`` times ``cv`` jobs available during each iteration.
 
-    pre_dispatch : int, or string, default = "2 * n_jobs"
-        Controls the number of jobs that get dispatched during parallel
-        execution. Reducing this number can be useful to avoid an
-        explosion of memory consumption when more jobs get dispatched
-        than CPUs can process. This parameter can be:
+    n_points : int, default=1
+        Number of parameter settings to sample in parallel. If this does
+        not align with ``n_iter``, the last iteration will sample less
+        points. See also :func:`~Optimizer.ask`
 
-            - An int, giving the exact number of total jobs that are
-              spawned
-
-            - A string, giving an expression as a function of n_jobs,
-              as in '2*n_jobs'
-
-    batch_size: int, default=1
-        Controls the number of tasks that get dispatched at the same time.
+    n_initial_points : int, default = 1
+        Must be >= n_points.
 
     iid : boolean, default=True
         If True, the data is assumed to be identically distributed across
@@ -142,9 +126,6 @@ class BayesSearchCV(BaseSearchCV):
         For integer/None inputs, if the estimator is a classifier and ``y`` is
         either binary or multiclass, :class:`StratifiedKFold` is used. In all
         other cases, :class:`KFold` is used.
-
-        Refer :ref:`User Guide <cross_validation>` for the various
-        cross-validation strategies that can be used here.
 
     refit : boolean, default=True
         Refit the best estimator with the entire dataset.
@@ -168,38 +149,40 @@ class BayesSearchCV(BaseSearchCV):
         If ``'False'``, the ``cv_results_`` attribute will not include training
         scores.
 
-    Example
-    -------
+    Examples
+    --------
 
-    from skopt import BayesSearchCV
-    # parameter ranges are specified by one of below
-    from skopt.space import Real, Categorical, Integer
-
-    from sklearn.datasets import load_iris
-    from sklearn.svm import SVC
-    from sklearn.model_selection import train_test_split
-
-    X, y = load_iris(True)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=0.75,
-                                                        random_state=0)
-
-    # log-uniform: understand as search over p = exp(x) by varying x
-    opt = BayesSearchCV(
-        SVC(),
-        {
-            'C': Real(1e-6, 1e+6, prior='log-uniform'),
-            'gamma': Real(1e-6, 1e+1, prior='log-uniform'),
-            'degree': Integer(1,8),
-            'kernel': Categorical(['linear', 'poly', 'rbf']),
-        },
-        n_iter=32
-    )
-
-    # executes bayesian optimization
-    opt.fit(X_train, y_train)
-
-    # model can be saved, used for predictions or scoring
-    print(opt.score(X_test, y_test))
+    >>> from skopt import BayesSearchCV
+    >>> # parameter ranges are specified by one of below
+    >>> from skopt.space import Real, Categorical, Integer
+    >>>
+    >>> from sklearn.datasets import load_iris
+    >>> from sklearn.svm import SVC
+    >>> from sklearn.model_selection import train_test_split
+    >>>
+    >>> X, y = load_iris(True)
+    >>> X_train, X_test, y_train, y_test = train_test_split(X, y,
+    ...                                                     train_size=0.75,
+    ...                                                     random_state=0)
+    >>>
+    >>> # log-uniform: understand as search over p = exp(x) by varying x
+    >>> opt = BayesSearchCV(
+    ...     SVC(),
+    ...     {
+    ...         'C': Real(1e-6, 1e+6, prior='log-uniform'),
+    ...         'gamma': Real(1e-6, 1e+1, prior='log-uniform'),
+    ...         'degree': Integer(1,8),
+    ...         'kernel': Categorical(['linear', 'poly', 'rbf']),
+    ...     },
+    ...     n_iter=32
+    ... )
+    >>>
+    >>> # executes bayesian optimization
+    >>> _ = opt.fit(X_train, y_train)
+    >>>
+    >>> # model can be saved, used for predictions or scoring
+    >>> print(opt.score(X_test, y_test))
+    0.973...
 
     Attributes
     ----------
@@ -295,25 +278,27 @@ class BayesSearchCV(BaseSearchCV):
 
     def __init__(self, estimator, search_spaces, deterministic=True,
                  optimizer_kwargs=None,
-                 n_iter=50, scoring=None, n_initial_points=1,
-                 n_points_per_iter=1, n_jobs=1, iid=True, refit=True, cv=None,
+                 n_iter=50, scoring=None, fit_params=None, n_initial_points=1,
+                 n_points=1, n_jobs=1, iid=True, refit=True, cv=None,
                  verbose=0, pre_dispatch='2*n_jobs', batch_size=1,
                  random_state=None, error_score='raise',
-                 return_train_score=False):
+                 return_train_score=True):
 
         self.search_spaces = search_spaces
-        self.deterministic = deterministic
         self.n_iter = n_iter
         self.n_initial_points = n_initial_points
-        self.n_points_per_iter = n_points_per_iter
-        self.pre_dispatch = pre_dispatch
-        self.batch_size = batch_size
+        self.n_points = n_points
         self.random_state = random_state
         self.optimizer_kwargs = optimizer_kwargs
         self._check_search_space(self.search_spaces)
+        # Temporary fix for compatibility with sklearn 0.20 and 0.21
+        # See scikit-optimize#762
+        # To be consistent with sklearn 0.21+, fit_params should be deprecated
+        # in the constructor and be passed in ``fit``.
+        self.fit_params = fit_params
 
         super(BayesSearchCV, self).__init__(
-            estimator=estimator, scoring=scoring, fit_params=None,
+            estimator=estimator, scoring=scoring,
             n_jobs=n_jobs, iid=iid, refit=refit, cv=cv, verbose=verbose,
             pre_dispatch=pre_dispatch, error_score=error_score,
             return_train_score=return_train_score)
@@ -377,21 +362,20 @@ class BayesSearchCV(BaseSearchCV):
         if isinstance(search_spaces, dict):
             search_spaces = [search_spaces]
 
-        n_iters, n_initial_points, n_points_per_iter = [], [], []
-        for sp in search_spaces:
-            params = sp[1] if isinstance(sp, tuple) else {}
+        n_iters, n_initial_points, n_points = [], [], []
+        for space in search_spaces:
+            params = space[1] if isinstance(space, tuple) else {}
             n_iter = params.get('n_iter', self.n_iter)
             n_initial = params.get('n_initial', self.n_initial_points)
-            points_per_iter = params.get('n_points_per_iter',
-                                         self.n_points_per_iter)
-            if n_initial < points_per_iter:
+            points = params.get('n_points', self.n_points)
+            if n_initial < points:
                 raise ValueError("Number of initial points must be at least "
-                                 "equal to n_points_per_iter")
+                                 "equal to n_points")
             n_initial_points.append(n_initial)
             n_iters.append(n_iter + n_initial)
-            n_points_per_iter.append(points_per_iter)
+            n_points.append(points)
 
-        return search_spaces, n_initial_points, n_iters, n_points_per_iter
+        return search_spaces, n_initial_points, n_iters, n_points
 
     # copied for compatibility with 0.19 sklearn from 0.18 BaseSearchCV
     @property
@@ -430,105 +414,103 @@ class BayesSearchCV(BaseSearchCV):
             if isinstance(search_space, tuple):
                 search_space = search_space[0]
 
-            print(search_space)
-
-            # TODO: different optimizer_kwargs per search space
+            # TODO: different optimizer_kwargs per search space ?
             kwargs = self.optimizer_kwargs_.copy()
             kwargs['dimensions'] = dimensions_aslist(search_space)
             optimizers.append(Optimizer(**kwargs))
 
-        self.optimizers_ = optimizers  # will save the states of the optimizers
+        # will save the states of the optimizers
+        # TODO: do not attach optimizers to the object by default. Make it
+        # configurable. Most of the time, it might not be useful to the user.
+        self.optimizers_ = optimizers
 
-    def _queue_tasks(self, cand_i, sp_i, sp, n_points, X, y, base_estimator,
-                     n_splits, fit_params, cand_logs, cv_iter, task_queue):
+    def _ask_new_tasks(self, point_idx, space_idx, space, n_points, X, y,
+                       base_estimator, n_splits, point_logs, cv_iter):
         '''
         Generate new points from the optimizer and add them to the queue of
         points to evaluate.
         '''
-        params = self.optimizers_[sp_i].ask(n_points=n_points)
+        params = self.optimizers_[space_idx].ask(n_points=n_points)
 
-        for cand_i, p in enumerate(params, cand_i + 1):
-            if _make_hashable(p) in cand_logs and self.deterministic:
-                for res in cand_logs[_make_hashable(p)]:
-                    res[-3] = cand_i
-                    task_queue.append(delayed(_return_input)(res))
-            else:
-                cand_logs[_make_hashable(p)] = [None] * n_splits
-                p_dict = point_asdict(sp, p)
-                for split_i, (train, test) in enumerate(cv_iter):
+        new_tasks = []
 
-                    args = [base_estimator,
-                            X, y, self.scorer_,
-                            train, test, self.verbose, p_dict]
+        for point_idx, param in enumerate(params, point_idx + 1):
 
-                    kwargs = dict(
-                        fit_params=fit_params,
-                        return_train_score=self.return_train_score,
-                        return_n_test_samples=True,
-                        return_times=True, return_parameters=True,
-                        error_score=self.error_score)
+            point_logs[point_idx] = [None] * n_splits
+            p_dict = point_asdict(space, param)
+            for split_i, (train, test) in cv_iter:
 
-                    cfg = (sp_i, cand_i, split_i, p)
+                args = [base_estimator, X, y, self.scorer_, train, test,
+                        self.verbose, p_dict]
 
-                    task_queue.append(delayed(_call_and_get_cfg)(
-                        _fit_and_score, cfg, args, kwargs))
+                kwargs = dict(
+                    fit_params=self.fit_params,
+                    return_train_score=self.return_train_score,
+                    return_n_test_samples=True,
+                    return_times=True, return_parameters=True,
+                    error_score=self.error_score)
 
-        return cand_i
+                cfg = (space_idx, point_idx, split_i, param)
 
-    def _gen_steps(self, pool, pre_dispatch, base_estimator, fit_params,
-                   n_initial_points, n_iters, n_points_per_iter, X, y,
-                   n_splits, search_spaces, cv_iter):
+                new_tasks.append((_fit_and_score, cfg, args, kwargs))
+
+        return new_tasks, point_idx
+
+    def _compute(self, client, base_estimator, n_initial_points, n_iters,
+                 n_points, X, y, n_splits, search_spaces, cv_iter):
         """Generate points asynchronously and log the results.
         """
 
         optimizers = self.optimizers_
-        cand_logs = {}  # save the scores for each candidate and each split
-        cand_i = -1  # index of candidates
-
-        task_queue = deque()
+        point_logs = {}  # save the scores for each candidate and each split
+        point_idx = -1  # index of points
 
         # initialize initial points for each search space
-        for sp_i, sp in enumerate(search_spaces):
-            cand_i = self._queue_tasks(
-                cand_i, sp_i, sp, n_initial_points[sp_i], X, y,
-                base_estimator, n_splits, fit_params, cand_logs,
-                cv_iter, task_queue,)
+        for space_idx, space in enumerate(search_spaces):
+            dispatched, point_idx = self._ask_new_tasks(
+                point_idx, space_idx, space, n_initial_points[space_idx], X, y,
+                base_estimator, n_splits, point_logs, cv_iter)
+            dispatched = client.map(_call_and_get_cfg, dispatched)
+            dispatched = as_completed(dispatched, with_results=True)
 
         # now get asynchronously the result and create new tasks from them
         # save the params and the mean scores for each search space
-        sp_partial_batch_results = [([], []) for sp in search_spaces]
+        space_arriving_results = [([], []) for space in search_spaces]
         n_iters_queued = n_initial_points
-        while n_iters_queued < n_iters or len(task_queue) > 0:
-            batch = pool.get_last_async_result()
-            for res in batch:
-                (sp_i, cand_i, split_i, p) = res[-4:]
-                cand_log = cand_logs[_make_hashable(p)]
-                cand_log[split_i] = res
-                # if all scores for all splits for all points of a batch
-                # are available we can compute the means, tell the
-                # optimizer and ask for a new batch.
-                try:
-                    scores = [res[-9] for res in cand_log]
-                    mean_score = np.mean(scores)
-                    params, scores = sp_partial_batch_results[sp_i]
-                    params.append(p)
-                    scores.append(-mean_score)
-                    remaining_iter = n_iters[sp_i] - n_iters_queued[sp_i]
-                    if len(scores) == n_points_per_iter[sp_i] \
-                            and remaining_iter > 0:
-                        sp_partial_batch_results[sp_i] = ([], [])
-                        optimizers[sp_i].tell(params, scores)
-                        n_points = min(n_points_per_iter[sp_i], remaining_iter)
-                        cand_i = self._queue_tasks(
-                            cand_i, sp_i, search_spaces[sp_i], n_points, X,
-                            y, base_estimator, n_splits, fit_params,
-                            cand_logs, cv_iter, task_queue,)
-                        n_iters_queued[sp_i] += n_points
-                except TypeError:
-                    pass
+        while n_iters_queued < n_iters:
+            res = dispatched.next()[1]
+            (space_idx, point_idx_out, split_idx, param) = res[-4:]
+            point_log = point_logs[point_idx_out]
+            point_log[split_idx] = res
+            # if all scores for all splits for all points of a batch
+            # are available we can compute the means, tell the
+            # optimizer and ask for a new batch.
+            scores = [res[-9] for res in point_log if res is not None]
+            if len(scores) == n_splits:
+                mean_score = np.mean(scores)
+                params, scores = space_arriving_results[space_idx]
+                params.append(param)
+                scores.append(-mean_score)
+                remaining_iter = n_iters[space_idx] - n_iters_queued[space_idx]
+                if len(scores) == n_points[space_idx] and remaining_iter > 0:
+                    space_arriving_results[space_idx] = ([], [])
+                    optimizers[space_idx].tell(params, scores)
+                    n_points_ = min(n_points[space_idx], remaining_iter)
+                    point_idx = self._ask_new_tasks(
+                        point_idx, space_idx, search_spaces[space_idx],
+                        n_points_, X, y, base_estimator, n_splits, point_logs,
+                        cv_iter)
+                    dispatched.update(client.map(_call_and_get_cfg,
+                                                 point_idx[0]))
+                    point_idx = point_idx[1]
+                    n_iters_queued[space_idx] += n_points_
 
-            for i in range(min(self.batch_size, len(task_queue))):
-                yield task_queue.popleft()
+        for res in dispatched:
+            res = res[1]
+            (space_idx, point_idx_out, split_idx, param) = res[-4:]
+            point_logs[point_idx_out][split_idx] = res[1]
+
+        return [res for point in point_logs.values() for res in point]
 
     @property
     def total_iterations(self):
@@ -548,7 +530,7 @@ class BayesSearchCV(BaseSearchCV):
             total_iter += n_iter
         return total_iter
 
-    def fit(self, X, y=None, groups=None, callbacks=None, **fit_params):
+    def fit(self, X, y=None, groups=None, callbacks=None):
         """Run fit on the estimator with randomly drawn parameters.
 
         Parameters
@@ -565,17 +547,16 @@ class BayesSearchCV(BaseSearchCV):
             train/test set.
         """
 
-        search_spaces, n_initial_points, n_iters, n_points_per_iter = \
+        search_spaces, n_initial_points, n_iters, n_points = \
             self._init_search_spaces()
 
         self._make_optimizers(search_spaces)
 
         estimator = self.estimator
-        cv = check_cv(self.cv, y,
-                      classifier=is_classifier(estimator))
+        cv = check_cv(self.cv, y, classifier=is_classifier(estimator))
         self.multimetric_ = False
-        self.scorer_ = check_scoring(
-            self.estimator, scoring=self.scoring)
+
+        self.scorer_ = check_scoring(self.estimator, scoring=self.scoring)
         X, y, groups = indexable(X, y, groups)
         n_splits = cv.get_n_splits(X, y, groups)
         n_candidates = sum(n_iters)
@@ -583,7 +564,6 @@ class BayesSearchCV(BaseSearchCV):
             print("Fitting {0} folds for each of {1} candidates, totalling"
                   " {2} fits".format(n_splits, n_candidates,
                                      n_candidates * n_splits))
-        cv_iter = list(cv.split(X, y, groups))
         n_jobs = self.n_jobs
         # account for case n_jobs < 0
         if n_jobs < 0:
@@ -591,30 +571,16 @@ class BayesSearchCV(BaseSearchCV):
 
         base_estimator = clone(self.estimator)
 
-        max_dispatch = np.inf
-        # optimal condition to limit max_dispatch to avoid process starvation
-        for ip, ipt in zip(n_initial_points, n_points_per_iter):
-            max_dispatch = min(int((ip - ipt) /
-                                   (2 + self.batch_size / n_splits)),
-                               max_dispatch)
-
-        if hasattr(self.pre_dispatch, 'endswith'):
-            pre_dispatch = int(eval(self.pre_dispatch))
-        else:
-            pre_dispatch = int(self.pre_dispatch)
-        if pre_dispatch > max_dispatch:
-            pre_dispatch = max_dispatch
-            print('Setting pre_dispatch to %r tasks to prevent '
-                  'process starvation' % pre_dispatch)
-
-        pool = Parallel(n_jobs=self.n_jobs, verbose=self.verbose,
-                        pre_dispatch=pre_dispatch, batch_size=self.batch_size
-                        )
-
-        out = pool(self._gen_steps(
-            pool, pre_dispatch, base_estimator, fit_params,
-            n_initial_points, n_iters, n_points_per_iter, X, y,
-            n_splits, search_spaces, cv_iter))
+        with Client(n_workers=n_jobs) as client:
+            # XXX: should we also scatter all the constant parameters of
+            # _fit_and_score ?
+            X, y, groups = client.scatter([X, y, groups])
+            cv_iter = [(idx, client.scatter([train, test]))
+                       for idx, train, test
+                       in enumerate(cv.split(X, y, groups))]
+            out = self._compute(
+                client, base_estimator, n_initial_points, n_iters, n_points,
+                X, y, n_splits, search_spaces, cv_iter)
 
         # sort by candidate and then by split.
         out = map(itemgetter(slice(None, -4)),
@@ -699,9 +665,9 @@ class BayesSearchCV(BaseSearchCV):
             best_estimator = clone(base_estimator).set_params(
                 **best_parameters)
             if y is not None:
-                best_estimator.fit(X, y, **fit_params)
+                best_estimator.fit(X, y, **(self.fit_params or {}))
             else:
-                best_estimator.fit(X, **fit_params)
+                best_estimator.fit(X, **(self.fit_params or {}))
             self.best_estimator_ = best_estimator
 
         return self
